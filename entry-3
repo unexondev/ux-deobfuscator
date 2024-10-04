@@ -1,4 +1,0 @@
-digraph html_table {
-	0 [label=<<table border="0" cellborder="0" cellpadding="3"><tr><td align="center" colspan="2" bgcolor="grey">loc_181ff4050</td></tr><tr><td align="left"><font color="blue1">PUSH       </font><font color="forestgreen">RBX</font></td></tr><tr><td align="left"><font color="blue1">JMP        </font><font color="darkslateblue">loc_181ff4050</font></td></tr></table>> fontname="Courier New" shape=Mrecord]
-	0 -> 0 [label="" color=blue]
-}
