@@ -45,6 +45,15 @@ mdis = machine.dis_engine(container.bin_stream, loc_db=container.loc_db)
 # mdis.follow_call = False
 # mdis.dontdis_retcall = False
 
+class DeobfuscateOptions(object):
+
+    deobfuscate_indirect_branches = False
+
+    deobfuscate_hidden_calls = False
+
+    def __init__(self) -> None:
+        pass
+
 class Symbexec(SymbolicExecutionEngine):
 
     print_steps = False
@@ -133,7 +142,6 @@ def get_branch_regs(lines):
 
     return None
 
-
 def get_cfg(offset, cfg_disassembled = None):
 
     lines_done = None
@@ -166,11 +174,7 @@ def find_single_path(asmcfg: AsmCFG, loc_dst):
 
         path.insert(0, pred)
 
-        if pred == asmcfg.heads()[0]:
-
-            return path
-
-    return []
+    return path
 
 def get_successors(asmcfg, block, state=None):
 
@@ -202,7 +206,7 @@ def get_successors(asmcfg, block, state=None):
 
     parent_path = find_single_path(asmcfg, loc_block_head)
 
-    if parent_path: parent_path.pop()
+    parent_path.pop()
 
     for bl_path_parent in parent_path:
         symbexec.execute(bl_path_parent)
@@ -264,7 +268,7 @@ def get_successors(asmcfg, block, state=None):
         "successors": [state.symbols[jmp_reg] for jmp_reg in jmp_regs]
     }
 
-def get_obfuscated_blocks(asmcfg):
+def get_indirect_branch_blocks(asmcfg):
 
     blocks_obf = []
 
@@ -276,9 +280,21 @@ def get_obfuscated_blocks(asmcfg):
 
     return blocks_obf
 
-def check_if_block_handled(asmcfg, offset):
+def get_hidden_call_blocks(asmcfg):
 
-    return any([ block.get_offsets()[0] == offset for block in asmcfg.blocks ])
+    blocks_obf = []
+
+    for block in asmcfg.blocks:
+
+        instr_call = block.get_subcall_instr()
+
+        if instr_call == None:
+            continue
+
+        if isinstance(instr_call.args[0], ExprId):
+           blocks_obf.append(block) 
+
+    return blocks_obf
 
 def get_opposite_postfix(postfix):
 
@@ -320,13 +336,11 @@ def get_opposite_postfix(postfix):
     
     return None
 
-def deobfuscate(asmcfg : AsmCFG, max_depth=None, depth=1):
-
-    if (depth - 1) == max_depth: return None
+def deobf_indirect_branches(asmcfg : AsmCFG, depth=1):
 
     # Get obfuscated blocks
 
-    blocks_obf = get_obfuscated_blocks(asmcfg)
+    blocks_obf = get_indirect_branch_blocks(asmcfg)
 
     if len(blocks_obf) == 0:
         
@@ -584,22 +598,76 @@ def deobfuscate(asmcfg : AsmCFG, max_depth=None, depth=1):
 
     depth += 1
 
-    deobfuscate(asmcfg, max_depth, depth)
+    deobf_indirect_branches(asmcfg, depth)
+
+def deobf_hidden_calls(asmcfg : AsmCFG):
+
+    # Get obfuscated blocks
+
+    blocks_obf = get_hidden_call_blocks(asmcfg)
+
+    if len(blocks_obf) == 0:
+        
+        LOG_MESSAGE("[%r]: Nothing to deobfuscate." % __name__)
+
+        return None
+    
+    LOG_MESSAGE("[%r]: Obfuscated block count on CFG is %i" % (__name__, len(blocks_obf)))
+
+    for block_obf in blocks_obf:
+
+        loc_block_obf = block_obf.loc_key
+
+        exec_path = find_single_path(asmcfg, loc_block_obf)
+
+        symbexec = Symbexec(mdis)
+
+        symbexec.set_cfg(asmcfg)
+
+        for bl_exec in exec_path:
+
+            symbexec.execute(bl_exec)
+
+        instr = block_obf.get_subcall_instr()
+
+        mem_reg = instr.args[0]
+
+        mem_val = symbexec.symbols[mem_reg]
+
+        if not isinstance(mem_val, ExprInt):
+            continue
+
+        mem_val = int(mem_val)
+
+        instr.args[0] = ExprInt(mem_val, 64)
+
+def deobfuscate(asmcfg : AsmCFG, options : DeobfuscateOptions):
+
+    if options.deobfuscate_indirect_branches:
+        deobf_indirect_branches(asmcfg)
+
+    if options.deobfuscate_hidden_calls:
+        deobf_hidden_calls(asmcfg)
 
     return asmcfg
-
 
 if __name__ == "__main__":
 
     LOG_SUCCESS("Main routine has started.\n")
 
-    offset = 0x182489c60 # 0x18248b4a2
+    offset = 0x182489c60
 
     cfg = get_cfg(offset)
 
-    cfg_deobf = deobfuscate(cfg, 50)
+    options = DeobfuscateOptions()
+    options.deobfuscate_indirect_branches = True
+    options.deobfuscate_hidden_calls = True
+
+    cfg_deobf = deobfuscate(cfg, options)
 
     blocks = list(cfg_deobf.blocks)
+
+    cfg_deobf.graphviz().render("output")
 
     for block in blocks:
 
@@ -614,8 +682,6 @@ if __name__ == "__main__":
             cfg_deobf.loc_db.unset_location_offset(block.loc_key)
 
             LOG_WARN("[%r]: Unset loc_key of: 0x%X" % (__name__, block.get_offsets()[0]))
-
-    cfg_deobf.graphviz().render("output")
 
     dinterval = interval(block.get_range() for block in blocks)
     print(interval([dinterval.hull()]))
