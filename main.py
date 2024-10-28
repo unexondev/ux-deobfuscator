@@ -11,6 +11,7 @@ from miasm.core.asmblock import AsmCFG
 from miasm.core.asmblock import assemble_block
 from miasm.ir.ir import IRCFG
 from miasm.arch.x86.arch import instruction_x86
+from miasm.core.interval import interval
 
 
 def LOG_MESSAGE(*msg):
@@ -133,9 +134,21 @@ def get_branch_regs(lines):
     return None
 
 
-def get_cfg(offset):
+def get_cfg(offset, cfg_disassembled = None):
 
-    return mdis.dis_multiblock(offset)    
+    lines_done = None
+
+    if cfg_disassembled is not None:
+
+        lines_done = set()
+
+        for block in list(cfg_disassembled.blocks):
+
+            for line in block.lines:
+
+                lines_done.add(line.offset)
+
+    return mdis.dis_multiblock(offset, cfg_disassembled, lines_done)   
 
 def find_single_path(asmcfg: AsmCFG, loc_dst):
 
@@ -351,20 +364,16 @@ def deobfuscate(asmcfg : AsmCFG, max_depth=None, depth=1):
 
         if is_conditional:
 
-            successor_true = res["successors"][0]
-            successor_false = res["successors"][1]
+            successor_true = int(res["successors"][0])
+            successor_false = int(res["successors"][1])
 
-            LOG_SUCCESS("[%r]: Successor (constraint = True) %r found on block %r" % (__name__, hex(int(successor_true)), hex(addr_bl_obf)))
-            LOG_SUCCESS("[%r]: Successor (constraint = False) %r found on block %r" % (__name__, hex(int(successor_false)), hex(addr_bl_obf)))
+            LOG_SUCCESS("[%r]: Successor (constraint = True) %r found on block %r" % (__name__, hex(successor_true), hex(addr_bl_obf)))
+            LOG_SUCCESS("[%r]: Successor (constraint = False) %r found on block %r" % (__name__, hex(successor_false), hex(addr_bl_obf)))
 
-            cfg_true = get_cfg(successor_true)
-            cfg_false = get_cfg(successor_false)
+            asmcfg = get_cfg(successor_false, get_cfg(successor_true, asmcfg))
 
-            asmcfg.merge(cfg_true)
-            asmcfg.merge(cfg_false)
-
-            loc_key_block_true = list(cfg_true.blocks)[0].loc_key
-            loc_key_block_false = list(cfg_false.blocks)[0].loc_key
+            loc_key_block_true = asmcfg.loc_db.get_or_create_offset_location(successor_true)
+            loc_key_block_false = asmcfg.loc_db.get_or_create_offset_location(successor_false)
 
             # Place direct jumps instead of indirect jumps to successors
 
@@ -389,7 +398,7 @@ def deobfuscate(asmcfg : AsmCFG, max_depth=None, depth=1):
 
                     break
 
-            if int(successor_true) == mem_next:
+            if successor_true == mem_next:
                 
                 postfix = get_opposite_postfix(postfix)
                 
@@ -403,7 +412,7 @@ def deobfuscate(asmcfg : AsmCFG, max_depth=None, depth=1):
                 
                 loc_key_next = loc_key_block_false
 
-                if int(successor_false) != mem_next:
+                if successor_false != mem_next:
 
                     jmp_no_next = True
 
@@ -444,6 +453,8 @@ def deobfuscate(asmcfg : AsmCFG, max_depth=None, depth=1):
 
                 asmcfg.add_block(block_next)
 
+                asmcfg.rebuild_edges()
+
                 # Now we have 2 blocks. First one will include conditional jump (on_true),
                 # second one will include unconditional jump (on_false)
 
@@ -451,6 +462,25 @@ def deobfuscate(asmcfg : AsmCFG, max_depth=None, depth=1):
 
                 instr_jmp.name = "J" + postfix
                 instr_jmp.args = [ ExprLoc(loc_key_to, 64) ]
+
+                # Sanity check for inner-block instructions
+                
+                if asmcfg.loc_key_to_block(loc_key_to) is None:
+                
+                    # Successor is disassembled, but still it's not corresponding to any block.
+                    # That means successor is located "inside a block" but not at its beginning.
+                    # We need to split outer block at that point to create a new block whose beginning is our successor
+
+                    offset_loc_to = asmcfg.loc_db.get_location_offset(loc_key_to)
+
+                    block_outer : AsmBlock = asmcfg.getby_offset(offset_loc_to)
+
+                    block_to = block_outer.split(offset_loc_to)
+
+                    asmcfg.add_block(block_to)
+
+                    # Call for preparing new edges for splitted and split block
+                    asmcfg.rebuild_edges()
 
                 # Add constraints for the first block
                 asmcfg.add_edge(block_obf.loc_key, loc_key_to, "c_to")
@@ -461,6 +491,23 @@ def deobfuscate(asmcfg : AsmCFG, max_depth=None, depth=1):
 
                 # instr_jmp.name = "JMP" # it's a JMP already
                 instr_jmp.args[0] = ExprLoc(loc_key_next, 64)
+
+                # Sanity check again for second block
+                # This block is defined as "next" but it is actually not next,
+                # that's why we need to sanity check for it as well
+                # Described in comments below
+
+                if asmcfg.loc_key_to_block(loc_key_next) is None:
+                
+                    offset_loc_next = asmcfg.loc_db.get_location_offset(loc_key_next)
+
+                    block_outer : AsmBlock = asmcfg.getby_offset(offset_loc_next)
+
+                    _block_next = block_outer.split(offset_loc_next)
+
+                    asmcfg.add_block(_block_next)
+
+                    asmcfg.rebuild_edges()
 
                 # Add constraint for the second block
                 asmcfg.add_edge(block_next.loc_key, loc_key_next, "c_to")
@@ -476,49 +523,74 @@ def deobfuscate(asmcfg : AsmCFG, max_depth=None, depth=1):
                 instr_jmp.args[0] = ExprLoc(loc_key_to, 64)
 
                 # Add constraints
+
+                # Sanity check
+                if asmcfg.loc_key_to_block(loc_key_to) is None:
+                
+                    offset_loc_to = asmcfg.loc_db.get_location_offset(loc_key_to)
+
+                    block_outer : AsmBlock = asmcfg.getby_offset(offset_loc_to)
+
+                    block_to = block_outer.split(offset_loc_to)
+
+                    asmcfg.add_block(block_to)
+
+                    asmcfg.rebuild_edges()
+
                 asmcfg.add_edge(block_obf.loc_key, loc_key_to, "c_to")
                 asmcfg.add_edge(block_obf.loc_key, loc_key_next, "c_next")
 
         else:
             
-            successor = res["successors"][0]
+            successor = int(res["successors"][0])
 
-            LOG_SUCCESS("[%r]: Successor %r found on block %r" % (__name__, hex(int(successor)), hex(addr_bl_obf)))
+            LOG_SUCCESS("[%r]: Successor %r found on block %r" % (__name__, hex(successor), hex(addr_bl_obf)))
 
-            cfg_next = get_cfg(successor)
+            asmcfg = get_cfg(successor, asmcfg)
 
-            asmcfg.merge(cfg_next)
-
-            loc_key_block_next = list(cfg_next.blocks)[0].loc_key
+            loc_key_succ = asmcfg.loc_db.get_or_create_offset_location(successor)
 
             # Place direct jumps instead of indirect jump to successor
 
             instr_jmp = block_obf.lines[-1]
             
-            instr_jmp.args[0] = ExprLoc(loc_key_block_next, 64)
+            instr_jmp.args[0] = ExprLoc(loc_key_succ, 64)
 
             if successor == mem_next:
 
-                asmcfg.add_edge(block_obf.loc_key, loc_key_block_next, "c_next")
+                asmcfg.add_edge(block_obf.loc_key, loc_key_succ, "c_next")
 
             else:
 
-                asmcfg.add_edge(block_obf.loc_key, loc_key_block_next, "c_to")
+                # Sanity check
+                if asmcfg.loc_key_to_block(loc_key_succ) is None:
+                
+                    offset_loc_succ = asmcfg.loc_db.get_location_offset(loc_key_succ)
+
+                    block_outer : AsmBlock = asmcfg.getby_offset(offset_loc_succ)
+
+                    block_succ = block_outer.split(offset_loc_succ)
+
+                    asmcfg.add_block(block_succ)
+
+                    asmcfg.rebuild_edges()                
+
+                asmcfg.add_edge(block_obf.loc_key, loc_key_succ, "c_to")
 
 
-    LOG_SUCCESS("[%r]: Resulting CFG: " % __name__, [ hex(bl.get_offsets()[0]) for bl in cfg.blocks ])
+    LOG_SUCCESS("[%r]: Resulting CFG: " % __name__, [ hex(bl.get_offsets()[0]) for bl in asmcfg.blocks ])
 
-    LOG_SUCCESS("Control flow deobfuscation is completed. Depth: %i\n" % depth)
+    LOG_SUCCESS("[%r]: Control flow deobfuscation is completed. Depth: %i\n" % (__name__, depth))
 
     depth += 1
 
-    deobfuscate(cfg, max_depth, depth)
+    deobfuscate(asmcfg, max_depth, depth)
 
-    return cfg
+    return asmcfg
 
 
 if __name__ == "__main__":
-    
+
     LOG_SUCCESS("Main routine has started.\n")
 
     offset = 0x182489c60 # 0x18248b4a2
@@ -527,23 +599,25 @@ if __name__ == "__main__":
 
     cfg_deobf = deobfuscate(cfg, 50)
 
-    # addr = 0x181ff338c
+    blocks = list(cfg_deobf.blocks)
 
-    # [ cfg_res, list_pin ] = runOnBlock(addr)
-    # cfg_res = fixChains(cfg_res, list_pin)
-
-    for block in list(cfg_deobf.blocks):
+    for block in blocks:
 
         preds = cfg_deobf.predecessors(block.loc_key)
 
-        for pred in preds:
+        if not preds: continue # head block
 
-            if cfg_deobf.edges2constraint[(pred, block.loc_key)] == "c_next":
+        c_next = any(cfg.edges2constraint[(pred, block.loc_key)] == "c_next" for pred in preds)
 
-                cfg_deobf.loc_db.unset_location_offset(block.loc_key)
+        if c_next:
 
-                break
+            cfg_deobf.loc_db.unset_location_offset(block.loc_key)
+
+            LOG_WARN("[%r]: Unset loc_key of: 0x%X" % (__name__, block.get_offsets()[0]))
 
     cfg_deobf.graphviz().render("output")
 
-    asm_res = asm_resolve_final(mdis.arch, cfg_deobf)
+    dinterval = interval(block.get_range() for block in blocks)
+    print(interval([dinterval.hull()]))
+    # This shit really sucks, gonna implement it myself
+    # asm_res = asm_resolve_final(mdis.arch, cfg_deobf, interval([dinterval.hull()]))
