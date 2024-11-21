@@ -3,7 +3,7 @@ from miasm.analysis.binary import Container
 from miasm.core.locationdb import LocationDB
 from miasm.core.asmblock import AsmBlock
 from miasm.arch.x86.arch import instruction_x86
-from miasm.expression.expression import ExprLoc, ExprInt, ExprId
+from miasm.expression.expression import ExprLoc, ExprInt, ExprId, ExprOp, ExprMem
 from miasm.core.asmblock import asm_resolve_final
 from miasm.core import parse_asm
 
@@ -20,24 +20,11 @@ mdis = machine.dis_engine(container.bin_stream, loc_db=container.loc_db)
 
 if __name__ == "__main__":
 
-    offset = 0x1400117c8
+    # offset = 0x140011780
 
-    cfg = mdis.dis_multiblock(offset)
+    # cfg = mdis.dis_multiblock(offset)
 
-    print(cfg.heads())
+    # cfg.graphviz().render("cfg-test")
 
-    cfg.graphviz().render("cfg-test")
-
-    for block in list(cfg.blocks):
-
-        preds = cfg.predecessors(block.loc_key)
-
-        c_next = any(cfg.edges2constraint[(pred, block.loc_key)] == "c_next" for pred in preds)
-
-        if c_next:
-
-            cfg.loc_db.unset_location_offset(block.loc_key)
-
-            print("Unset: 0x%X" % block.get_offsets()[0])
-
-    asm_resolve_final(mdis.arch, cfg)
+    instr = instruction_x86(name="LEA", mode=64, args=[ ExprId("RCX", 64), ExprMem(ExprOp("+", ExprId("RIP", 64), ExprInt(0x10000000, 64)), 64) ])
+    print(machine.mn.dis(machine.mn.asm(instr)[0], 64, 0))

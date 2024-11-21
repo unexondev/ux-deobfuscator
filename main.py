@@ -12,6 +12,8 @@ from miasm.core.asmblock import assemble_block
 from miasm.ir.ir import IRCFG
 from miasm.arch.x86.arch import instruction_x86
 from miasm.core.interval import interval
+from miasm.arch.x86.regs import regs08_expr, regs16_expr, regs32_expr, regs64_expr
+import ctypes
 
 
 def LOG_MESSAGE(*msg):
@@ -19,7 +21,6 @@ def LOG_MESSAGE(*msg):
     print("\u001b[36m", *msg, "\u001b[0m", sep="")
 
 def LOG_WARN(*msg):
-    
     print("\u001b[33m", *msg, "\u001b[0m", sep="")
 
 def LOG_ERROR(*msg):
@@ -48,8 +49,8 @@ mdis = machine.dis_engine(container.bin_stream, loc_db=container.loc_db)
 class DeobfuscateOptions(object):
 
     deobfuscate_indirect_branches = False
-
     deobfuscate_hidden_calls = False
+    remove_deadcodes = False
 
     def __init__(self) -> None:
         pass
@@ -335,6 +336,107 @@ def get_opposite_postfix(postfix):
         return opposites[postfix]
     
     return None
+
+def compute_block_deadcodes(asmcfg : AsmCFG, block : AsmBlock):
+
+    # First, backwards search for ADD instructions with valid format
+
+    lines = block.lines
+
+    set_deadcodes = set()
+
+    for i in range(len(lines) - 1, -1, -1):
+
+        line : instruction_x86 = lines[i]
+
+        if line.name == "ADD" and isinstance(line.args[1], ExprMem):
+
+            # Now find the last "define" location for register before ADD operation
+
+            arg_reg, arg_mem = line.args
+
+            if arg_reg not in regs64_expr:
+                continue
+
+            i_arg_regs64 = regs64_expr.index(arg_reg)
+
+            arg_reg_exs = [ regs08_expr[i_arg_regs64], regs16_expr[i_arg_regs64], regs32_expr[i_arg_regs64], arg_reg ]
+
+            c_reg = None
+            c_mem = None
+
+            for j in range(i - 1, -1, -1):
+
+                if c_reg and c_mem: break
+
+                _line : instruction_x86 = lines[j]
+
+                if not c_reg and _line.name == "MOV" and _line.args[0] in arg_reg_exs:
+
+                    arg_const = _line.args[1]
+
+                    if not isinstance(arg_const, ExprInt): break
+
+                    c_reg = ctypes.c_longlong(int(arg_const)).value
+
+                    set_deadcodes.add(_line)
+
+                if not c_mem and _line.name == "MOV" and _line.args[0] == arg_mem:
+
+                    arg_mem_reg = _line.args[1]
+
+                    if not isinstance(arg_mem_reg, ExprId): break
+
+                    fail = False
+                    for k in range(j - 1, -1, -1):
+
+                        __line : instruction_x86 = lines[k]
+
+                        if __line.name == "LEA" and __line.args[0] == arg_mem_reg:
+
+                            arg_const_op = __line.args[1].ptr
+
+                            if len(arg_const_op.args) < 2:
+
+                                fail = True
+
+                                break
+
+                            arg_const = arg_const_op.args[1]
+
+                            if not isinstance(arg_const, ExprInt):
+
+                                fail = True
+
+                                break
+
+                            c_mem = ctypes.c_longlong(int(arg_const)).value
+
+                            c_mem += __line.offset + __line.l
+
+                            set_deadcodes.add(__line)
+
+                            break
+
+                    if fail: break
+
+                    else: set_deadcodes.add(_line)
+            
+            if c_reg and c_mem:
+
+                c_sum = c_reg + c_mem
+
+                _line = instruction_x86(name="LEA", mode=64, args=[ arg_reg, ExprMem(ExprOp("+", ExprId("RIP", 64), ExprInt(0x10000000, 64)), 64) ])
+
+                instr_lea = machine.mn.dis(machine.mn.asm(_line)[0], 64, 0)
+                instr_lea.offset = line.offset
+                instr_lea.args[1] = ExprMem(ExprOp("+", ExprId("RIP", 64), ExprInt(ctypes.c_ulong(c_sum - (instr_lea.offset + instr_lea.l)).value, 64)), 64)
+
+                lines[i] = instr_lea
+
+    for deadcode in set_deadcodes:
+
+        lines.remove(deadcode)
 
 def deobf_indirect_branches(asmcfg : AsmCFG, depth=1):
 
@@ -639,7 +741,14 @@ def deobf_hidden_calls(asmcfg : AsmCFG):
 
         mem_val = int(mem_val)
 
-        instr.args[0] = ExprInt(mem_val, 64)
+        instr.args[0] = ExprLoc(cfg.loc_db.get_or_create_offset_location(mem_val), 64)
+
+def remove_deadcodes(asmcfg : AsmCFG):
+
+    for block in asmcfg.blocks:
+
+        compute_block_deadcodes(asmcfg, block)
+
 
 def deobfuscate(asmcfg : AsmCFG, options : DeobfuscateOptions):
 
@@ -648,6 +757,9 @@ def deobfuscate(asmcfg : AsmCFG, options : DeobfuscateOptions):
 
     if options.deobfuscate_hidden_calls:
         deobf_hidden_calls(asmcfg)
+
+    if options.remove_deadcodes:
+        remove_deadcodes(asmcfg)
 
     return asmcfg
 
@@ -662,12 +774,13 @@ if __name__ == "__main__":
     options = DeobfuscateOptions()
     options.deobfuscate_indirect_branches = True
     options.deobfuscate_hidden_calls = True
+    options.remove_deadcodes = True
 
     cfg_deobf = deobfuscate(cfg, options)
 
     blocks = list(cfg_deobf.blocks)
 
-    cfg_deobf.graphviz().render("output")
+    cfg_deobf.graphviz().render("output-deadcode")
 
     for block in blocks:
 
